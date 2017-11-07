@@ -28,271 +28,193 @@ local ftcsv = {
 }
 
 -- lua 5.1 load compat
-local M = {}
-if type(jit) == 'table' or _ENV then
-    M.load = _G.load
-else
-    M.load = loadstring
-end
-
--- perf
-local sbyte = string.byte
-local ssub = string.sub
-
 -- luajit specific speedups
 -- luajit performs faster with iterating over string.byte,
 -- whereas vanilla lua performs faster with string.find
-if type(jit) == 'table' then
-    -- finds the end of an escape sequence
-    function M.findClosingQuote(i, inputLength, inputString, quote, doubleQuoteEscape)
-        -- local doubleQuoteEscape = doubleQuoteEscape
-        local currentChar, nextChar = sbyte(inputString, i), nil
-        while i <= inputLength do
-            -- print(i)
-            nextChar = sbyte(inputString, i+1)
+local M = {}
+if type(jit) == 'table' or _ENV then
+  M.load = _G.load
+  M.find_char = function(chunk, start_pos, a, b, c)
+    a = a and string.byte(a)
+    b = b and string.byte(b)
+    c = c and string.byte(c)
 
-            -- this one deals with " double quotes that are escaped "" within single quotes "
-            -- these should be turned into a single quote at the end of the field
-            if currentChar == quote and nextChar == quote then
-                doubleQuoteEscape = true
-                i = i + 2
-                currentChar = sbyte(inputString, i)
+    local end_pos = chunk:len()
 
-            -- identifies the escape toggle
-            elseif currentChar == quote and nextChar ~= quote then
-                -- print("exiting", i-1)
-                return i-1, doubleQuoteEscape
-            else
-                i = i + 1
-                currentChar = nextChar
-            end
-        end
+    while start_pos <= end_pos do
+      local x = string.byte(chunk, start_pos)
+      if x == a or x == b or x == c then
+        return start_pos
+      end
+      start_pos = start_pos + 1
     end
-
+    return nil
+  end
 else
-    -- vanilla lua closing quote finder
-    function M.findClosingQuote(i, inputLength, inputString, quote, doubleQuoteEscape)
-        local firstCharIndex = 1
-        local firstChar, iChar = nil, nil
-        repeat
-            firstCharIndex, i = inputString:find('".?', i+1)
-            firstChar = sbyte(inputString, firstCharIndex)
-            iChar = sbyte(inputString, i)
-            -- nextChar = string.byte(inputString, i+1)
-            -- print("HI", offset, i)
-            -- print(firstChar, iChar)
-            if firstChar == quote and iChar == quote then
-                doubleQuoteEscape = true
-            end
-        until iChar ~= quote
-        if i == nil then
-            return inputLength-1, doubleQuoteEscape
-        end
-        -- print("exiting", i-2)
-        return i-2, doubleQuoteEscape
+  M.load = loadstring
+  M.find_char = function(chunk, start_pos, a, b, c)
+    local pattern = string.format('[%s%s%s]', a or '', b or '', c or '')
+    return chunk:find(pattern, start_pos)
+  end
+end
+
+-- parse and return a field from the given chunk.  Chunk is not guaranteed to
+-- contain a complete field, a field may span chunks.  Field is a state object
+-- which should be preserved between calls if the field is not complete
+local function parse_field(chunk, separator, field)
+  local function find_closing_quote(chunk, start_pos)
+    start_pos = start_pos or 1
+    local quote_pos = M.find_char(chunk, start_pos, '"')
+    if not quote_pos or chunk:sub(quote_pos + 1, quote_pos + 1) ~= '"' then
+      return quote_pos
+    end
+    return find_closing_quote(chunk, quote_pos + 2)
+  end
+
+  local function create_field()
+    return {
+      content = '',
+      complete = true,
+      quoted = false,
+      ended_with_separator = false
+    }
+  end
+
+  -- if we've reached the end of the input and have an incomplete field, see if we
+  -- can complete it.  If the input ended with a separator, create an empty field.
+  -- Return a completed field or nil
+  if not chunk or chunk == "" then
+    if field then
+      if field.complete and field.ended_with_separator then
+        field = create_field()
+        field.complete = false
+      end
+      if not field.complete and not field.quoted then
+        field.complete = true
+        return field
+      end
+    end
+    return nil
+  end
+
+  if not field or field.complete then
+    field = create_field()
+  end
+
+  -- if this is the start of a new field, check for an opening quote and remove it.
+  if field.complete and not field.quoted and chunk:sub(1, 1) == '"' then
+    field.quoted = true
+    chunk = chunk:sub(2)
+  end
+
+  -- if the field is quoted, add to the field content everything up to the closing
+  -- quote, otherwise add everything up to the next field/record separator.
+  local break_pos
+  if field.quoted then
+    break_pos = find_closing_quote(chunk)
+  else
+    break_pos = M.find_char(chunk, 1, separator, '\r', '\n')
+  end
+
+  -- remove the content from the chunk and append it to the existing field content.
+  -- if we found a break, the field is complete, otherwise it is incomplete.
+  field.complete = (break_pos and true) or false
+  field.content = field.content .. chunk:sub(1, break_pos and break_pos - 1)
+  chunk = break_pos and chunk:sub(break_pos) or ''
+
+  -- if the field is quoted and we've found the end quote, remove the quote from
+  -- the remainder, escape any double quotes and mark it complete.
+  if field.quoted and chunk:sub(1, 1) == '"' then
+    field.content = field.content:gsub('""', '"')
+    chunk = chunk:sub(2)
+  end
+
+  -- if the field ended with a separator, make a note of it.
+  if chunk:sub(1, 1) == separator then
+    field.ended_with_separator = true
+  end
+
+  return field, chunk
+end
+
+local row_handler
+row_handler = {
+  data = nil,
+  field = nil,
+  reader = nil,
+  separator = nil,
+
+  -- return and reset the row data
+  complete = function(self)
+    local d = self.data
+    self.data = nil
+    return d
+  end,
+
+  -- parse and insert a field into the row, creating the row when the first field is found.
+  parse_row = function(self, chunk)
+    self.field, chunk = parse_field(chunk, self.separator, self.field)
+
+    if self.field and self.field.complete then
+      if self.field.content then
+        self.data = self.data or {}
+        self.data[#self.data + 1] = self.field.content
+      end
     end
 
-end
-
--- load an entire file into memory
-local function loadFile(textFile)
-    local file = io.open(textFile, "r")
-    if not file then error("ftcsv: File not found at " .. textFile) end
-    local allLines = file:read("*all")
-    file:close()
-    return allLines
-end
-
--- creates a new field and adds it to the main table
-local function createField(inputString, quote, fieldStart, i, doubleQuoteEscape)
-    local field
-    -- so, if we just recently de-escaped, we don't want the trailing \"
-    if sbyte(inputString, i-1) == quote then
-        -- print("Skipping last \"")
-        field = ssub(inputString, fieldStart, i-2)
+    if chunk then
+      local next_char = chunk:sub(1, 1)
+      if next_char == '\r' then
+        chunk = chunk:sub(2)
+        next_char = chunk:sub(1, 1)
+      end
+      self.reader.put_back(chunk:sub(2))
+      if next_char == '\n' then
+        return self:complete()
+      end
     else
-        field = ssub(inputString, fieldStart, i-1)
+      return self:complete()
     end
-    if doubleQuoteEscape then
-        -- print("QUOTE REPLACE")
-        -- print(line[fieldNum])
-        field = field:gsub('""', '"')
+  end,
+
+  -- the iterator function which processes chunks until a row is complete
+  -- or the chunk stream ends.
+  iter = function(row)
+    local chunk
+    for chunk in row.reader.strings do
+      local row_data = row:parse_row(chunk)
+      if row_data then
+        return row_data, row
+      end
     end
-    return field
-end
+    -- try to finish an incomplete row.
+    return row:parse_row(), row
+  end,
 
--- main function used to parse
-local function parseString(inputString, inputLength, delimiter, i, headerField, fieldsToKeep)
+  -- create and return an instance of the row_handler
+  create = function(reader, separator)
+    return {
+      data = nil,
+      field = nil,
+      reader = reader,
+      separator = separator,
+      complete = row_handler.complete,
+      parse_row = row_handler.parse_row,
+    }
+  end
+}
 
-    -- keep track of my chars!
-    local currentChar, nextChar = sbyte(inputString, i), nil
-    local skipChar = 0
-    local field
-    local fieldStart = i
-    local fieldNum = 1
-    local lineNum = 1
-    local doubleQuoteEscape = false
-    local exit = false
-
-    --bytes
-    local CR = sbyte("\r")
-    local LF = sbyte("\n")
-    local quote = sbyte('"')
-    local delimiterByte = sbyte(delimiter)
-
-    local assignValue
-    local outResults
-    -- the headers haven't been set yet.
-    -- aka this is the first run!
-    if headerField == nil then
-        -- print("this is for headers")
-        headerField = {}
-        assignValue = function()
-            headerField[fieldNum] = field
-            return true
-        end
-    else
-        -- print("this is for magic")
-        outResults = {}
-        outResults[1] = {}
-        assignValue = function()
-            if not pcall(function()
-                outResults[lineNum][headerField[fieldNum]] = field
-            end) then
-                error('ftcsv: too many columns in row ' .. lineNum)
-            end
-        end
-    end
-
-    -- calculate the initial line count (note: this can include duplicates)
-    local headerFieldsExist = {}
-    local initialLineCount = 0
-    for _, value in pairs(headerField) do
-        if not headerFieldsExist[value] and (fieldsToKeep == nil or fieldsToKeep[value]) then
-            headerFieldsExist[value] = true
-            initialLineCount = initialLineCount + 1
-        end
-    end
-
-    while i <= inputLength do
-        -- go by two chars at a time! currentChar is set at the bottom.
-        -- currentChar = string.byte(inputString, i)
-        nextChar = sbyte(inputString, i+1)
-        -- print(i, string.char(currentChar), string.char(nextChar))
-
-        -- empty string
-        if currentChar == quote and nextChar == quote then
-            -- print("EMPTY STRING")
-            skipChar = 1
-            fieldStart = i + 2
-            -- print("fs+2:", fieldStart)
-
-        -- identifies the escape toggle.
-        -- This can only happen if fields have quotes around them
-        -- so the current "start" has to be where a quote character is.
-        elseif currentChar == quote and nextChar ~= quote and fieldStart == i then
-            -- print("New Quoted Field", i)
-            fieldStart = i + 1
-            i, doubleQuoteEscape = M.findClosingQuote(i+1, inputLength, inputString, quote, doubleQuoteEscape)
-            -- print("I VALUE", i, doubleQuoteEscape)
-            skipChar = 1
-
-        -- create some fields if we can!
-        elseif currentChar == delimiterByte then
-            -- create the new field
-            -- print(headerField[fieldNum])
-            if fieldsToKeep == nil or fieldsToKeep[headerField[fieldNum]] then
-                field = createField(inputString, quote, fieldStart, i, doubleQuoteEscape)
-            -- print("FIELD", field, "FIELDEND", headerField[fieldNum], lineNum)
-            -- outResults[headerField[fieldNum]][lineNum] = field
-                assignValue()
-            end
-            doubleQuoteEscape = false
-
-            fieldNum = fieldNum + 1
-            fieldStart = i + 1
-            -- print("fs+1:", fieldStart)
-        -- end
-
-        -- newline?!
-        elseif ((currentChar == CR and nextChar == LF) or currentChar == LF) then
-            if fieldsToKeep == nil or fieldsToKeep[headerField[fieldNum]] then
-                -- create the new field
-                field = createField(inputString, quote, fieldStart, i, doubleQuoteEscape)
-
-                -- outResults[headerField[fieldNum]][lineNum] = field
-                exit = assignValue()
-                if exit then
-                    if (currentChar == CR and nextChar == LF) then
-                        return headerField, i + 1
-                    else
-                        return headerField, i
-                    end
-                end
-            end
-            doubleQuoteEscape = false
-
-            -- determine how line ends
-            if (currentChar == CR and nextChar == LF) then
-                -- print("CRLF DETECTED")
-                skipChar = 1
-                fieldStart = fieldStart + 1
-                -- print("fs:", fieldStart)
-            end
-
-            -- incrememnt for new line
-            if fieldNum < initialLineCount then
-                error('ftcsv: too few columns in row ' .. lineNum)
-            end
-            lineNum = lineNum + 1
-            outResults[lineNum] = {}
-            fieldNum = 1
-            fieldStart = i + 1 + skipChar
-            -- print("fs:", fieldStart)
-
-        end
-
-        i = i + 1 + skipChar
-        if (skipChar > 0) then
-            currentChar = sbyte(inputString, i)
-        else
-            currentChar = nextChar
-        end
-        skipChar = 0
-    end
-
-    -- create last new field
-    if fieldsToKeep == nil or fieldsToKeep[headerField[fieldNum]] then
-        field = createField(inputString, quote, fieldStart, i, doubleQuoteEscape)
-        assignValue()
-    end
-
-    -- clean up last line if it's weird (this happens when there is a CRLF newline at end of file)
-    -- doing a count gets it to pick up the oddballs
-    local finalLineCount = 0
-    local lastValue = nil
-    for k, v in pairs(outResults[lineNum]) do
-        finalLineCount = finalLineCount + 1
-        lastValue = v
-    end
-
-    -- this indicates a CRLF
-    -- print("Final/Initial", finalLineCount, initialLineCount)
-    if finalLineCount == 1 and lastValue == "" then
-        outResults[lineNum] = nil
-
-    -- otherwise there might not be enough line
-    elseif finalLineCount < initialLineCount then
-        error('ftcsv: too few columns in row ' .. lineNum)
-    end
-
-    return outResults
+-- create and return a row parser iterator function
+local function row_parser(reader, separator)
+  local row = row_handler.create(reader, separator)
+  return row_handler.iter, row
 end
 
 -- runs the show!
-function ftcsv.parse(inputFile, delimiter, options)
+function ftcsv.parse(input, delimiter, options)
     -- delimiter MUST be one character
     assert(#delimiter == 1 and type(delimiter) == "string", "the delimiter must be of string type and exactly one character")
+    assert(type(input) == "string" or type(input) == 'function', "input must be string or a function")
 
     -- OPTIONS yo
     local header = true
@@ -326,70 +248,128 @@ function ftcsv.parse(inputFile, delimiter, options)
             assert(type(options.loadFromString) == "boolean", "ftcsv only takes a boolean value for optional parameter 'loadFromString'. You passed in '" .. tostring(options.loadFromString) .. "' of type '" .. type(options.loadFromString) .. "'.")
             loadFromString = options.loadFromString
         end
+        if loadFromString then
+            assert(type(input) == "string", "optional parameter 'loadFromString' can only be used with a string input")
+        end
         if options.headerFunc ~= nil then
             assert(type(options.headerFunc) == "function", "ftcsv only takes a function value for optional parameter 'headerFunc'. You passed in '" .. tostring(options.headerFunc) .. "' of type '" .. type(options.headerFunc) .. "'.")
             headerFunc = options.headerFunc
         end
     end
 
-    -- handle input via string or file!
-    local inputString
-    if loadFromString then
-        inputString = inputFile
-    else
-        inputString = loadFile(inputFile)
+    -- generate iterator functions for the string input types.
+    if type(input) == "string" then
+      local inputString = input
+      if not loadFromString then
+        local file = io.open(input, "r")
+        if not file then error("ftcsv: File not found at " .. input) end
+        inputString = file:read("*all")
+        file:close()
+      end
+
+      input = function()
+        local s = inputString
+        inputString = nil
+        return s
+      end
     end
-    local inputLength = #inputString
 
-    -- if they sent in an empty file...
-    if inputLength == 0 then
-        error('ftcsv: Cannot parse an empty file')
-    end
+    -- generate a reader function to wrap the input iterator function
+    local function reader(iter)
+      local remainder
 
-    -- parse through the headers!
-    local headerField, i = parseString(inputString, inputLength, delimiter, 1)
-    i = i + 1 -- start at the next char
-
-    -- make sure a header isn't empty
-    for _, header in ipairs(headerField) do
-        if #header == 0 then
-            error('ftcsv: Cannot parse a file which contains empty headers')
+      return {
+        strings = function()
+          local chunk = remainder
+          remainder = nil
+          if not chunk then
+            chunk = iter()
+          end
+          return chunk
+        end,
+        put_back = function(chunk)
+          if chunk ~= '' then
+            remainder = chunk
+          end
         end
+      }
+    end
+    input = reader(input)
+
+    local row_data
+    local parser, row = row_parser(input, delimiter)
+
+    -- parse the first row and generate the headers.
+    row_data, row = parser(row)
+    if not row_data then
+      error('ftcsv: Cannot parse an empty file')
+    elseif #row_data == 0 then
+      error('ftcsv: Cannot parse a file which contains empty headers')
     end
 
-    -- for files where there aren't headers!
-    if header == false then
-        i = 0
-        for j = 1, #headerField do
-            headerField[j] = j
-        end
+    -- rename and transform the headers, storing both a forward and reverse index
+    local headerIndex = {}
+    local reverseHeaderIndex = {}
+    for i,v in ipairs(row_data) do
+      if header then
+        headerIndex[i] = (rename and rename[v]) or v
+      else
+        headerIndex[i] = (rename and rename[i]) or i
+      end
+      if headerFunc then
+        headerIndex[i] = headerFunc(headerIndex[i]) or headerIndex[i]
+      end
+      if headerIndex[i] == '' then
+        error('ftcsv: Cannot parse a file which contains empty headers')
+      end
+      reverseHeaderIndex[headerIndex[i]] = i
     end
 
-    -- rename fields as needed!
-    if rename then
-        -- basic rename (["a" = "apple"])
-        for j = 1, #headerField do
-            if rename[headerField[j]] then
-                -- print("RENAMING", headerField[j], rename[headerField[j]])
-                headerField[j] = rename[headerField[j]]
-            end
-        end
-        -- files without headers, but with a rename need to be handled too!
-        if #rename > 0 then
-            for j = 1, #rename do
-                headerField[j] = rename[j]
-            end
-        end
+    -- generate the final, ordered header list, discarding any unwanted fields and
+    -- removing duplicates keeping the last occurance
+    local headerField = {}
+    for i,v in ipairs(headerIndex) do
+      if (not fieldsToKeep or fieldsToKeep[v]) and reverseHeaderIndex[v] == i then
+        headerField[#headerField + 1] = v
+      else
+        headerIndex[i] = false
+      end
     end
 
-    -- apply some sweet header manipulation
-    if headerFunc then
-        for j = 1, #headerField do
-            headerField[j] = headerFunc(headerField[j])
+    -- done with the reverse index now.
+    reverseHeaderIndex = nil
+
+    -- create a new row in the output with the given data, skipping any unwanted
+    -- columns
+    local output = {}
+    local function store_row(row_data)
+      if not row_data then return end
+
+      if #row_data < #headerIndex then
+        error('ftcsv: too few columns in row '..tostring(#output + 1))
+      elseif #row_data > #headerIndex then
+        error('ftcsv: too many columns in row '..tostring(#output + 1))
+      end
+
+      local stored_data = {}
+      for i,v in ipairs(row_data) do
+        if headerIndex[i] then
+          stored_data[headerIndex[i]] = v
         end
+      end
+      output[#output + 1] = stored_data
     end
 
-    local output = parseString(inputString, inputLength, delimiter, i, headerField, fieldsToKeep)
+    -- if the first row is not a header row, add it to the output
+    if not header then
+      store_row(row_data)
+    end
+
+    -- finally, iterate the remaining rows, adding them to the output
+    for row_data, row in parser, row do
+      store_row(row_data)
+    end
+
     return output, headerField
 end
 

@@ -16,14 +16,33 @@ luarocks install ftcsv
 
 
 ## Parsing
-### `ftcsv.parse(fileName, delimiter [, options])`
+### `ftcsv.parse(input, delimiter [, options])`
 
-ftcsv will load the entire csv file into memory, then parse it in one go, returning a lua table with the parsed data and a lua table containing the column headers. It has only two required parameters - a file name and delimiter (limited to one character). A few optional parameters can be passed in via a table (examples below).
+ftcsv will parse the input returning a lua table with the parsed data and a lua table containing the column headers. It has only two required parameters - `input` and `delimiter` (limited to one character). A few optional parameters can be passed in via a table (examples below).
+`input` can be either:
+ - a filename;
+ - a string containing raw CSV content (when `options.loadFromString` is `true`); or
+ - an iterator function that returns the CSV content as one or more string chunks.
 
+If `input` is a filename, then the entire content of the file will be read into memory and parsed as a single string.
 Just loading a csv file:
 ```lua
 local ftcsv = require('ftcsv')
 local zipcodes, headers = ftcsv.parse("free-zipcode-database.csv", ",")
+```
+
+Loading a CSV file, line by line:
+```lua
+local ftcsv = require('ftcsv')
+local file = io.open('free-zipcode-database.csv', 'r')
+local iter = function()
+  local s = file:read("*L")
+  if s == '' then
+    return nil
+  end
+  return s
+end
+local zipcodes, headers = ftcsv.parse(iter, ",")
 ```
 
 ### Options
